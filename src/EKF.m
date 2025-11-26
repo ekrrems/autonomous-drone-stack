@@ -1,205 +1,225 @@
 %%% =========================================================
-%   IMU-only EKF with Ground Truth Position Updates (UZH-FPV)
-%   - World frame: ENU  (X-East, Y-North, Z-Up)
-%   - IMU frame:  X-forward, Y-right, Z-down
+%   Real-time IMU + OpenVINS Transformation Fusion
 %%% =========================================================
 
 clc; clear; close all;
 
-%% ---------------------------------------------------------
-%   LOAD BAG AND EXTRACT DATA
-% ----------------------------------------------------------
-bagPath = fullfile(pwd, "../data/converted_bag/");
+%% ----------------- GLOBAL STATE (shared with callbacks) ---
+global ekf_state ekf_P ekf_initialized last_imu_time ekf_noise;
+global traj_est ovins_line;
 
-imgTopic = "/snappy_cam/stereo_l";
-imuTopic = "/snappy_imu";
-gtTopic  = "/groundtruth/pose";
+ekf_initialized = false;
+last_imu_time   = [];
 
-bag = ros2bagreader(bagPath);
+% allocate state & covariance (values will be overwritten on init)
+ekf_state = struct( ...
+    'p',  zeros(3,1), ...       % position
+    'v',  zeros(3,1), ...       % velocity
+    'q',  [1;0;0;0], ...        % quaternion body->world [w x y z]
+    'ba', zeros(3,1), ...       % accel bias
+    'bg', zeros(3,1));          % gyro bias
 
-imgMsgs = readMessages(select(bag, 'Topic', imgTopic));
-imuMsgs = readMessages(select(bag, 'Topic', imuTopic));
-gtMsgs  = readMessages(select(bag, 'Topic', gtTopic));
+ekf_P = 1e-4 * eye(15);         % 15D error covariance
 
-fprintf("Loaded %d IMU  | %d GT | %d images\n", ...
-        numel(imuMsgs), numel(gtMsgs), numel(imgMsgs));
+% Process-noise parameters
+ekf_noise.sigma_a  = 0.05;      % m/s^2 / sqrt(Hz)
+ekf_noise.sigma_g  = 0.005;     % rad/s / sqrt(Hz)
+ekf_noise.sigma_ba = 0.0005;    % accel bias Random Walk (RW)
+ekf_noise.sigma_bg = 0.0005;    % gyro  bias RW
 
-%% ---------------------------------------------------------
-%   TIMESTAMPS
-% ---------------------------------------------------------
-imuTimes = cellfun(@(m) double(m.header.stamp.sec) + ...
-                           double(m.header.stamp.nanosec)*1e-9, imuMsgs);
-
-gtTimes = cellfun(@(m) double(m.header.stamp.sec) + ...
-                          double(m.header.stamp.nanosec)*1e-9, gtMsgs);
-
-%% ---------------------------------------------------------
-%   GROUND TRUTH POSITIONS (XYZ) + ORIENTATION  (world=ENU)
-% ---------------------------------------------------------
-gtPos = zeros(3, numel(gtMsgs));
-gtRot = zeros(4, numel(gtMsgs));   % quaternion [w x y z]
-
-for i = 1:numel(gtMsgs)
-    gtPos(:,i) = [gtMsgs{i}.pose.position.x;
-                  gtMsgs{i}.pose.position.y;
-                  gtMsgs{i}.pose.position.z];
-
-    q_tmp = [gtMsgs{i}.pose.orientation.w;
-             gtMsgs{i}.pose.orientation.x;
-             gtMsgs{i}.pose.orientation.y;
-             gtMsgs{i}.pose.orientation.z];
-
-    gtRot(:,i) = q_tmp / norm(q_tmp);
-end
-
-% Shift GT so trajectory starts at origin (only for plotting/comparison)
-gt_pos0   = gtPos(:,1);
-gtPos_rel = gtPos - gt_pos0;
-
-% Interpolate GT to IMU timestamps
-gt_interp = interp1(gtTimes, gtPos_rel', imuTimes, 'linear', 'extrap')';
-
-%% ---------------------------------------------------------
-%   IMU-BASED STATISTICS FOR INITIALIZATION
-% ---------------------------------------------------------
-N  = numel(imuMsgs);
-N0 = min(200, N);   % first ~200 IMU samples
-
-acc0  = zeros(3, N0);
-gyro0 = zeros(3, N0);
-
-for i = 1:N0
-    a_body = [imuMsgs{i}.linear_acceleration.x;
-              imuMsgs{i}.linear_acceleration.y;
-              imuMsgs{i}.linear_acceleration.z];
-
-    w_body = [imuMsgs{i}.angular_velocity.x;
-              imuMsgs{i}.angular_velocity.y;
-              imuMsgs{i}.angular_velocity.z];
-
-    % transform IMU frame -> ENU
-    acc0(:,i)  = imu2enu(a_body);
-    gyro0(:,i) = imu2enu(w_body);
-end
-
-mean_acc  = mean(acc0, 2);   % ENU
-mean_gyro = mean(gyro0, 2);  % ENU
-
-%% ---------------------------------------------------------
-%   INITIAL EKF STATE (world frame = ENU of /groundtruth/pose)
-% ---------------------------------------------------------
-state = struct();
-
-% Use ground-truth orientation at first GT sample
-q0 = gtRot(:,1);           % [w x y z]
-q0 = q0 / norm(q0);
-
-state.q = q0;              % orientation body->world (ENU)
-state.p = zeros(3,1);      % position starts at origin (relative GT)
-state.v = zeros(3,1);      % assume small initial velocity
-
-% Gravity in ENU
-g_enu = [0; 0; -9.81];
-
-% Body->world rotation at t0
-Rwb0 = quat2rotm_matlab(state.q);
-
-% Choose accel bias so that a_world ≈ 0 on average in the "static" window:
-% a_world = Rwb0 * (mean_acc - ba) + g_enu ≈ 0  ⇒  ba ≈ mean_acc + Rwb0' * g_enu
-state.ba = mean_acc + Rwb0.' * g_enu;
-
-% Gyro bias from mean
-state.bg = mean_gyro;
-
-% 15D error state covariance
-P = 1e-4 * eye(15);
-
-% Process noise std devs (tune if you want)
-noise.sigma_a  = 0.02;    % accel noise  [m/s^2 / sqrt(Hz)]
-noise.sigma_g  = 0.001;   % gyro noise   [rad/s / sqrt(Hz)]
-noise.sigma_ba = 0.0001;  % accel bias rw
-noise.sigma_bg = 0.0001;  % gyro bias rw
-
-%% ---------------------------------------------------------
-%   VISUALIZATION SETUP
-% ---------------------------------------------------------
+%% Initiate Figure
 figure; hold on; grid on;
 xlabel('X'); ylabel('Y'); zlabel('Z');
 axis equal;
-title("IMU-only EKF (blue) vs Ground Truth (green)");
+title('IMU+OVINS EKF  (blue)  vs  OVINS pose (red)');
 
-traj_est = animatedline('Color','b','LineWidth',2); % EKF
-traj_gt  = animatedline('Color','g','LineWidth',2); % Ground truth
+traj_est  = animatedline('Color','b','LineWidth',2); % EKF fused traj
+ovins_line = animatedline('Color','r','LineWidth',2); % raw OVINS pose
 
-% Plot full GT once (relative, in ENU)
-addpoints(traj_gt, gtPos_rel(1,:), gtPos_rel(2,:), gtPos_rel(3,:));
+view(2);   % XY Plane
 
-%% ---------------------------------------------------------
-%   MAIN EKF LOOP: Prediction (IMU) + Update (GT position)
-% ---------------------------------------------------------
-estPos = zeros(3, N);
+%% TCP Connection Setup
+port = 5055;
+server = tcpserver("0.0.0.0", port, ...
+    "ConnectionChangedFcn", @connectionHandler);
 
-R_meas = (0.05^2) * eye(3);   % 5 cm std-dev position measurement
+disp("Waiting for TCP client (Docker / ESP32 / etc.) ...");
 
-for k = 2:N
-
-    dt = imuTimes(k) - imuTimes(k-1);
-    if dt <= 0, continue; end
-
-    % --------------------------
-    % RAW IMU (body frame, X fwd, Y right, Z down)
-    % --------------------------
-    acc_body = [imuMsgs{k}.linear_acceleration.x;
-                imuMsgs{k}.linear_acceleration.y;
-                imuMsgs{k}.linear_acceleration.z];
-
-    gyro_body = [imuMsgs{k}.angular_velocity.x;
-                 imuMsgs{k}.angular_velocity.y;
-                 imuMsgs{k}.angular_velocity.z];
-
-    % Transform IMU -> ENU frame
-    imu.acc  = imu2enu(acc_body);
-    imu.gyro = imu2enu(gyro_body);
-
-    % -----------------------------------------------------
-    % 1) EKF prediction (IMU only)
-    % -----------------------------------------------------
-    [state, P] = ekf_predict_imu(state, P, imu, dt, noise);
-
-    % -----------------------------------------------------
-    % 2) EKF update using GT position as "GPS" (for testing)
-    % -----------------------------------------------------
-    if k <= size(gt_interp,2)
-        z = gt_interp(:,k);   % 3x1 position in ENU, relative
-    else
-        z = gt_interp(:,end);
+while true
+    pause(0.5);
+    if server.Connected
+        disp("Client connected!");
+        break;
     end
-
-    [state, P] = ekf_update_position(state, P, z, R_meas);
-
-    estPos(:,k) = state.p;
-
-    % -----------------------------------------------------
-    % 3) Plot
-    % -----------------------------------------------------
-    addpoints(traj_est, state.p(1), state.p(2), state.p(3));
-    drawnow limitrate;
 end
 
-disp("Done.");
+% Callback for whenever bytes arrive
+configureCallback(server, "byte", 1, @dataReceived);
+disp("Callbacks configured. EKF now running event-driven.");
 
-%% ================== Helper functions ==================
+while true        % Without this the script gets stuck at callbacks
+    pause(0.1);
+end
+
+%% Callbacks & Data Parsers
+
+function dataReceived(server, ~)
+    % Called whenever new bytes arrive on the TCP socket
+    persistent buffer;
+    if isempty(buffer)
+        buffer = uint8([]);
+    end
+
+    if server.NumBytesAvailable <= 0
+        return;
+    end
+
+    newBytes = read(server, server.NumBytesAvailable, "uint8");
+    buffer   = [buffer; newBytes(:)];
+
+    buffer = parseMessages(buffer);
+end
+
+function buffer = parseMessages(buffer)
+    while true
+        try
+            if numel(buffer) < 7
+                break;                       % not enough for header+len
+            end
+
+            header = char(buffer(1:3).');    % 'IMU','PTH',...
+            payloadLen = typecast(uint8(buffer(4:7)), 'uint32');
+
+            if numel(buffer) < 7 + payloadLen
+                break;                       % wait for full message
+            end
+
+            payload = buffer(8 : 7+payloadLen);
+            buffer  = buffer(8+payloadLen : end);  % drop processed
+
+            switch header
+                case "IMU"
+                    handleIMU(payload);
+                case "PTH"
+                    handlePTH(payload);
+                case "PCD"
+                    % Could be used to show 3D points
+                case "IMG"
+                    % Could be matched with the poses
+                otherwise
+                    fprintf("❓ Unknown header: %s\n", header);
+            end
+
+        catch ME
+            fprintf("❌ parseMessages error: %s\n", ME.message);
+            return;
+        end
+    end
+end
+
+function handleIMU(payload)
+    % Parse IMU info and predict system state
+    global ekf_state ekf_P ekf_initialized last_imu_time ekf_noise;
+
+    try
+        json_str = char(payload(:).');
+        data = jsondecode(json_str);
+
+        % ========= ADAPT TO YOUR JSON FORMAT HERE =========
+        % Assumed JSON (example):
+        % { "timestamp": 123.456,
+        %   "ax": ..., "ay": ..., "az": ...,
+        %   "gx": ..., "gy": ..., "gz": ... }
+        t  = data.timestamp;     % [s]
+        a_body = [data.ax; data.ay; data.az];   % m/s^2 (body frame)
+        w_body = [data.gx; data.gy; data.gz];   % rad/s  (body frame)
+        % ===================================================
+
+        % First IMU → initialize simple state (flat, zero biases)
+        if ~ekf_initialized
+            ekf_state.p  = zeros(3,1);
+            ekf_state.v  = zeros(3,1);
+            ekf_state.q  = [1;0;0;0];   % identity: world~=body initially
+            ekf_state.ba = zeros(3,1);
+            ekf_state.bg = zeros(3,1);
+
+            last_imu_time = t;
+            ekf_initialized = true;
+            fprintf("EKF initialized from first IMU sample.\n");
+            return;
+        end
+
+        dt = t - last_imu_time;
+        if dt <= 0
+            return;
+        end
+        last_imu_time = t;
+
+        % Convert IMU -> ENU
+        imu.acc  = imu2enu(a_body);
+        imu.gyro = imu2enu(w_body);
+
+        [ekf_state, ekf_P] = ekf_predict_imu(ekf_state, ekf_P, imu, dt, ekf_noise);
+
+        % uncomment to see pure prediction trajectory
+        % global traj_est;
+        % addpoints(traj_est, ekf_state.p(1), ekf_state.p(2), ekf_state.p(3));
+        % drawnow limitrate;
+
+    catch err
+        fprintf("Error in handleIMU: %s\n", err.message);
+    end
+end
+
+function handlePTH(payload)
+    % Parse the OpenVINS Pose data and plot it
+    global ekf_state ekf_P traj_est ovins_line;
+
+    try
+        json_str = char(payload(:).');
+        data     = jsondecode(json_str);
+
+        % Convert OVINS coordinate system to ENU
+        R_ovins_to_enu = [ 0  1  0;
+                          -1  0  0;
+                           0  0  1];
+
+        p_imu = [data.poses.x; data.poses.y; data.poses.z];
+        p_enu = R_ovins_to_enu * p_imu;
+
+        % Plot raw OVINS pose (red)
+        addpoints(ovins_line, p_enu(1), p_enu(2), p_enu(3));
+
+        % EKF update with this pose
+        if ~isempty(ekf_P)
+            R_meas = (0.02^2) * eye(3);   % 5 cm std-dev (Could be tuned)
+            [ekf_state, ekf_P] = ekf_update_position(ekf_state, ekf_P, p_enu, R_meas);
+
+            addpoints(traj_est, ekf_state.p(1), ekf_state.p(2), ekf_state.p(3));
+            drawnow limitrate;
+        end
+
+    catch err
+        fprintf("Error in handlePTH: %s\n", err.message);
+    end
+end
+
+function connectionHandler(server, event)
+    if server.Connected
+        disp("✅ Client connected to MATLAB TCP server.");
+    else
+        disp("⚠️ Client disconnected.");
+    end
+end
+
+%% ================== EKF & MATH HELPERS ====================
 
 function v_enu = imu2enu(v)
     % IMU frame: x forward, y right, z down
     % ENU frame: x East, y North, z Up
-    % Mapping:
-    %   imu x (forward) -> ENU y
-    %   imu y (right)   -> ENU x
-    %   imu z (down)    -> ENU -z
-    R = [ 0  1  0;
-          1  0  0;
-          0  0 -1 ];
+    R = [ 0  1  0;    % x_fwd → y
+          1  0  0;    % y_right → x
+          0  0 -1 ];  % z_down → -z
     v_enu = R * v;
 end
 
@@ -229,7 +249,7 @@ function q_out = quat_mult(q1, q2)
 end
 
 function q = expmap_quat(dtheta)
-    % Small rotation vector dtheta (3x1) -> quaternion [w x y z]
+    % Rotation vector dtheta (3x1) -> quaternion [w x y z]
     theta = norm(dtheta);
     if theta < 1e-8
         q = [1; 0; 0; 0];
@@ -243,104 +263,73 @@ function q = expmap_quat(dtheta)
     end
 end
 
-%% ================== EKF prediction ==================
 function [state, P] = ekf_predict_imu(state, P, imu, dt, noise)
-    % EKF IMU prediction (error-state, 15D)
-    % state: struct with fields p,v,q,ba,bg
-    % P    : 15x15 error covariance
-    % imu  : struct with fields acc (3x1), gyro (3x1)
-    % dt   : time step
-    % noise: struct with sigma_a, sigma_g, sigma_ba, sigma_bg
-
+    % Error-state IMU prediction (15-dim error state).
     g = [0; 0; -9.81];   % gravity in world (ENU)
 
-    % ----- 1) Nominal propagation -----
-    a_m = imu.acc;   % measured accel (body)  (specific force)
-    w_m = imu.gyro;  % measured gyro  (body)
+    % Nominal State variables
+    a_m = imu.acc;
+    w_m = imu.gyro;
 
-    a = a_m - state.ba;   % bias corrected accel
-    w = w_m - state.bg;   % bias corrected gyro
+    a = a_m - state.ba;
+    w = w_m - state.bg;
 
-    % Rotation body -> world
     Rwb = quat2rotm_matlab(state.q);
-
-    % world-frame acceleration
     acc_world = Rwb * a + g;
 
     state.p = state.p + state.v * dt + 0.5 * acc_world * dt^2;
     state.v = state.v + acc_world * dt;
 
-    % Quaternion integration
     dq = expmap_quat(w * dt);
     state.q = quat_mult(state.q, dq);
     state.q = state.q / norm(state.q);
 
-    % ----- 2) Error-state Jacobians F and G -----
+    % Error State variables
     F = zeros(15,15);
     G = zeros(15,12);
-
     I3 = eye(3);
 
-    % indices: [δp(1:3); δv(4:6); δθ(7:9); δba(10:12); δbg(13:15)]
+    % indices: [δp; δv; δθ; δba; δbg]
 
-    % δp_dot = δv
-    F(1:3,4:6) = I3;
+    F(1:3,4:6)   = I3;                 % δp_dot = δv
+    F(4:6,7:9)   = -Rwb * skew(a);     % δv_dot part
+    F(4:6,10:12) = -Rwb;               % accel bias
+    F(7:9,7:9)   = -skew(w);           % attitude dynamics
+    F(7:9,13:15) = -I3;                % gyro bias coupling
 
-    % δv_dot = -R*[a]_x δθ - R δba
-    F(4:6,7:9)   = -Rwb * skew(a);
-    F(4:6,10:12) = -Rwb;
+    G(4:6,1:3)      = -Rwb;            % accel noise
+    G(7:9,4:6)      = -I3;            % gyro noise
+    G(10:12,7:9)    = I3;             % accel bias RW
+    G(13:15,10:12)  = I3;             % gyro  bias RW
 
-    % δθ_dot = -[w]_x δθ - δbg
-    F(7:9,7:9)   = -skew(w);
-    F(7:9,13:15) = -I3;
-
-    % Noise mapping (process noise = [n_a; n_g; n_ba; n_bg] ∈ R^12)
-    G(4:6,1:3)      = -Rwb;   % accel noise
-    G(7:9,4:6)      = -I3;    % gyro noise
-    G(10:12,7:9)    = I3;     % accel bias rw
-    G(13:15,10:12)  = I3;     % gyro bias rw
-
-    % ----- 3) Discretize -----
-    Phi = eye(15) + F*dt;   % first-order state transition
+    Phi = eye(15) + F*dt;
 
     Qa   = (noise.sigma_a)^2   * eye(3);
     Qg   = (noise.sigma_g)^2   * eye(3);
     Qba  = (noise.sigma_ba)^2  * eye(3);
     Qbg  = (noise.sigma_bg)^2  * eye(3);
+    Qc   = blkdiag(Qa, Qg, Qba, Qbg);
 
-    Qc = blkdiag(Qa, Qg, Qba, Qbg);  % 12x12 continuous
+    Qd = G * Qc * G.' * dt;
 
-    Qd = G * Qc * G.' * dt;          % discrete approx
-
-    % ----- 4) Covariance propagation -----
     P = Phi * P * Phi.' + Qd;
 end
 
-%% ================== EKF position-only update ==================
 function [state, P] = ekf_update_position(state, P, z, R)
-    % Position-only measurement update for error-state EKF
-    % state: struct with fields p,v,q,ba,bg
-    % P    : 15x15 covariance
-    % z    : 3x1 measured position (e.g. GT)
-    % R    : 3x3 measurement noise covariance
-
+    % Position-only measurement update.
     I3  = eye(3);
     I15 = eye(15);
 
-    % measurement jacobian H (3x15)
     H = zeros(3,15);
-    H(1:3,1:3) = I3;   % z = p + noise
+    H(1:3,1:3) = I3;     % measurement = position
 
-    % innovation
     z_pred = state.p;
     y = z - z_pred;
 
-    % Kalman gain
     S = H * P * H.' + R;
-    K = P * H.' / S;    % 15x3
+    K = P * H.' / S;
 
-    % error-state update
-    delta_x = K * y;    % 15x1
+    delta_x = K * y;
 
     delta_p  = delta_x(1:3);
     delta_v  = delta_x(4:6);
@@ -356,6 +345,5 @@ function [state, P] = ekf_update_position(state, P, z, R)
     state.ba = state.ba + delta_ba;
     state.bg = state.bg + delta_bg;
 
-    % covariance update (Joseph form)
     P = (I15 - K*H) * P * (I15 - K*H).' + K*R*K.';
 end
