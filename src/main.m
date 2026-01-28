@@ -20,7 +20,7 @@ totalTime = 10; % Can be tuned
 gravity = [0, 0, -9.81]; % In the ENU system
 
 initStates.Position = [0, 0, 100]; % As the starting Position
-initStates.Velocity = [0, 40, 0];
+initStates.Velocity = [0, 60, 0];
 initStates.OrientationQuat = [1, 0, 0, 0];
 initStates.AngularVel = [0, 0, deg2rad(30)];
 initStates.Acceleration = gravity;

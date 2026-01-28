@@ -45,7 +45,7 @@ classdef Drone < handle
       obj.torqueCmd = [0,0,0];
       obj.thrustCmd = 0;
 
-      obj.pose_des = [0, 0, 90];
+      obj.pose_des = [30, 0, 90];
 
       obj.vel_des = [0,0,0]; % Hover state
       obj.acc_des = [0,0,0];
@@ -68,12 +68,6 @@ classdef Drone < handle
     end
 
     function state = getState(obj)
-      %disp("The pose"); disp(obj.pose);
-      %disp("The velocity"); disp(obj.vel);
-      %disp("The acceleration"); disp(obj.accel);
-      %disp("The quaternions"); disp(obj.quat);
-      %disp("The angular velocity"); disp(obj.angularVel);
-      
       state = [obj.pose, obj.vel, obj.accel, obj.quat, obj.angularVel];
     end
 
@@ -83,22 +77,20 @@ classdef Drone < handle
 
     function obj = updateState(obj, acc, dt)
       obj.dt = dt;
-      % obj.accel = acc;
 
       Rb2w = obj.rotateBody2World();
       thrustWorld = Rb2w * [0; 0; -obj.thrustCmd];
       accWorld = thrustWorld / obj.m + obj.g';
 
-      %accWorld = Rb2w * obj.accel' + obj.g';  % Might be transposed
-      disp("Acceleration world orientet"); disp(accWorld);
+      disp("Acceleration world orientiered"); disp(accWorld);
 
       obj.vel = obj.vel + accWorld' * obj.dt;
       obj.pose = obj.pose + obj.vel * dt + 0.5 * accWorld' * obj.dt^2;
 
       % Need to update the angular velocity
-      deltaOmega = (inv(obj.I) * obj.torqueCmd) * dt; % 3x1 % inv(obj.I) has 3x3, torqueCmd has 1x3 after getting the transpose it is 3x1
-      omega_new = obj.angularVel' + deltaOmega; % angularVel (1x3) with transpose (3x1), deltaOmega (3x1)
-      obj.angularVel = omega_new'; % we take it back to 1x3 shape
+      deltaOmega = (inv(obj.I) * obj.torqueCmd) * dt;
+      omega_new = obj.angularVel' + deltaOmega;
+      obj.angularVel = omega_new';
      
       obj.quat = obj.updateQuaternion(obj.angularVel, obj.dt);
     end

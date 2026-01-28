@@ -8,69 +8,57 @@ The project is organized into branches, where every branch focuses on one core p
 
 ---
 
-## EKF Demo Video
+## Geometric Controller of Quatrotor Drone (SE(3)-based Control)
 
-A short demo video showing the EKF prediction & update running live is included here:
+The goal is to enable a quadrotor to track a desired position and yaw angle, using a control law that computes the required thrust and torque direclty from position,
+velocity, and orientation errors. The controller is robust to aggressive maneuvers and maintains full control of both translation and rotation.
+
+A short demo video showing the drone with initial velocity trying to find the desired position and hover on it:
 
 ➡ ![video](https://github.com/ekrrems/autonomous-drone-stack/blob/ekf_fusion/data/images/Screen_Recording.gif?raw=true)
 
 The video shows:
-- OpenVINS poses (red)
-- EKF estimated trajectory (blue)
-
+- Thrown drone with initial velocity
+- Hovering and controlling itself on desired position
 ---
 
 ## Project Goals
 
-- Implement an **IMU-based Extended Kalman Filter (EKF)** from scratch  
-- Fuse real IMU data with visual odometry (OpenVINS)  
-- Build a complete **state estimation pipeline**  
-- Add **PID control** for brushless motors (next branch)  
-- Build a full **autonomous flight stack**  
-- Eventually integrate everything into ROS 2 + SLAM + onboard ESP32 systems  
-- Document everything transparently for learning & reproducibility
+- Geometric tracking control on SE(3)
+- Thrust and attitude control
+- Torque control
+- Realistic simulation environment
 
 ---
-## 🧭 EKF Module (This Branch)
 
-This branch (`ekf`) implements:
+## 🧭 Geometric Controller Module
+This branch (`geometric_controller`) implements:
 
-### **1. IMU Preprocessing**
-- Transform IMU readings from **IMU frame (X fwd, Y right, Z down)**  
-  into **ENU (East, North, Up)**.
-- Bias initialization from static IMU samples.
-- Gravity compensation in ENU.
+### **1. Thrust and Attitude Control**
+- The drone computes the desired thrust direction based on position and velocity errors.
+- A desired rotation matrix is build so the drone tilts toward this thrust direction, while aligning tis yaw with a given heading.
+- The resulting thrust and desired orientation are used to control the drone in 3D space.
 
-### **2. Nominal State Propagation**
-We propagate:
+### **2. Torque Control**
 
-- Position  
-- Velocity  
-- Orientation (via quaternion exponential map)  
-- Accelerometer bias  
-- Gyroscope bias  
+- The drone calculate orientation and angular velocity errors by comparing its current orientation with the desired one.
+- Using these errors, it computes the necessary torque to rotate itself into the correct pose.
+- The torque control includes inertia, feedwoward, and gyroscopic compensation to ensure stability.
 
-Using continuous dynamics and first-order discretization.
-
-### **3. Error-State EKF**
-We maintain a **15-dimensional error state*
-[ δp, δv, δθ, δba, δbg ]
-
-And update it with:
-
-- Measurement Jacobian  
-- Innovation  
-- Kalman Gain  
-- Joseph-form covariance update (numerically stable)
-
-### **4. OpenVINS Position Updates**
-We receive pose messages from OpenVINS via TCP and fuse them as a **position-only update** in the EKF.
-
-This simulates how a real drone would fuse:
-- IMU (high rate)  
-- Visual odometry (lower rate)  
+### **3. Simulation Environment**
+- The system is simualted in MATLAB using a custom drone model and the uavScenario 3D envrionment.
+- The drone is initialized at a high altitute and commanded to hover or follow a simple trajectory.
+- The controller stabilizes the drone using only internal feedback(No ground truth corrections).
+- All simulations are visualized in 3D, and the thrust/torque outputs are monitored over time.
 
 ---
+
+## Outcomes
+
+- The drone successfully stabilizes and follows simple target positions.
+- Orientation remains controlled during flight, with correct yaw alignment.
+- The simulation demostrate that geometric control can handle full SE(3) motion, including rotation and aggressive translations.
+- This module forms one of the key basis for **fully autonomous flight** in later branches.
 
 ## Technology Stack
 
@@ -79,21 +67,6 @@ This simulates how a real drone would fuse:
 - **OpenVINS** for visual-inertial odometry  
 - **TCP networking** to fuse real-time sensor streams  
 - **ESP32** (coming in later branches) for embedded IMU + camera + motor control  
-- **Future:** PID loops, onboard control, SLAM, planning, navigation
-
----
-
-## Branch Structure
-
-Every branch implements one self-contained part of the drone:
-
-- `ekf_fusion` → IMU-based error-state EKF 
-- `pid` → PID motor control  
-- `motor_drivers` → ESC + PWM control  
-- `quad_dynamics` → full 6-DoF drone dynamics  
-- `sensor_fusion` → EKF + camera + IMU fusion  
-- `slam` → monocular / stereo SLAM  
-- `ros_integration` → ROS 2 nodes, topics, visualization  
-- `autonomous_flight` → full drone autonomy
+- **Future:** Control loops, onboard control, SLAM, planning, navigation
 
 ---
