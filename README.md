@@ -15,7 +15,7 @@ velocity, and orientation errors. The controller is robust to aggressive maneuve
 
 A short demo video showing the drone with initial velocity trying to find the desired position and hover on it:
 
-➡ ![video](https://github.com/ekrrems/autonomous-drone-stack/blob/ekf_fusion/data/images/Screen_Recording.gif?raw=true)
+➡ ![video](https://github.com/ekrrems/autonomous-drone-stack/blob/geometric_controller/data/geometric_controller.gif)
 
 The video shows:
 - Thrown drone with initial velocity
